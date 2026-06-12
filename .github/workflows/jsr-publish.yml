@@ -145,6 +145,10 @@ jobs:
       - name: Commit the auto-bump back
         if: steps.ver.outputs.bumped == 'true' && !inputs.dry-run && inputs.bump-commit
         run: |
+          if git diff --quiet -- deno.json; then
+            echo "deno.json unchanged (bump resolved to the current version) — nothing to commit"
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add deno.json

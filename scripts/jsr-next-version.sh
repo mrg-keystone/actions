@@ -58,8 +58,16 @@ if ! curl -fsS -A "$UA" "$API/versions/$VER" >/dev/null 2>&1; then
 fi
 
 # --- 3. derive the bump from the pushed commit range --------------------------
-LATEST="$(curl -fsS -A "$UA" "$API/versions?limit=1000" |
+# The versions LIST is CDN-cached (s-maxage=86400) for anonymous requests and
+# can be MINUTES stale right after a publish; an authenticated request bypasses
+# the cache. Belt and suspenders: send the token when we have one, add a
+# cache-buster, and never trust the list below VER — the single-version GET
+# above just PROVED that VER is published, so the base is max(list, VER).
+LIST_LATEST="$(curl -fsS -A "$UA" ${JSR_TOKEN:+-H "Authorization: Bearer $JSR_TOKEN"} \
+  "$API/versions?limit=1000&cb=$(date +%s)" |
   jq -r '(.items // .) | .[]? | select(.yanked != true) | .version' | sort -V | tail -1)"
+LATEST="$(printf '%s\n%s\n' "$LIST_LATEST" "$VER" | sort -V | tail -1)"
+[ "$LATEST" != "$LIST_LATEST" ] && echo "::notice::versions list is CDN-stale (says $LIST_LATEST; $VER is proven published) — basing the bump on $VER"
 BUMP=patch
 if [ -n "$RANGE" ] && git rev-parse -q --verify "${RANGE%%..*}^{commit}" >/dev/null 2>&1; then
   LOG="$(git log --format=%B "$RANGE")"
