@@ -1,0 +1,11 @@
+{
+  "name": "@mrg-keystone/actions-smoke",
+  "version": "0.0.1",
+  "license": "MIT",
+  "exports": {
+    ".": "./mod.ts"
+  },
+  "imports": {
+    "#danet/swagger/decorators": "jsr:@danet/swagger@^2.1.1/decorators"
+  }
+}

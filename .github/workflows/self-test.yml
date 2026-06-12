@@ -1,0 +1,55 @@
+# Self-test: run the reusable jsr-publish workflow in dry-run mode against
+# the smoke fixture on every push/PR. Exercises preflight (live registry
+# subpath validation), version computation (the not-on-JSR path — the
+# fixture package name is never published), and the dry-run publish gate —
+# without a token and without touching the registry.
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  jsr-publish-dry-run:
+    uses: ./.github/workflows/jsr-publish.yml
+    with:
+      working-directory: fixtures/smoke-package
+      dry-run: true
+
+  scripts-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: jsr-next-version — not-on-JSR path uses deno.json as-is
+        run: |
+          set -euo pipefail
+          unset GITHUB_OUTPUT
+          out="$(bash scripts/jsr-next-version.sh fixtures/smoke-package/deno.json "" )"
+          echo "$out"
+          echo "$out" | grep -q "version=0.0.1"
+          echo "$out" | grep -q "bumped=false"
+      - name: jsr-next-version — bump math against a real published package
+        run: |
+          set -euo pipefail
+          # keep is live on JSR: copying its name with its CURRENT latest
+          # version forces the auto-bump path; with no commit range the bump
+          # is a patch of whatever the registry's latest is.
+          unset GITHUB_OUTPUT
+          tmp="$(mktemp -d)"
+          LATEST="$(curl -fsS "https://api.jsr.io/scopes/mrg-keystone/packages/keep/versions?limit=1000" \
+            | jq -r '(.items // .) | .[]? | select(.yanked != true) | .version' | sort -V | tail -1)"
+          jq -n --arg v "$LATEST" '{name: "@mrg-keystone/keep", version: $v, exports: {".": "./mod.ts"}}' > "$tmp/deno.json"
+          out="$(bash scripts/jsr-next-version.sh "$tmp/deno.json" "")"
+          echo "$out"
+          echo "$out" | grep -q "bumped=true"
+          NEW="$(jq -r .version "$tmp/deno.json")"
+          [ "$NEW" != "$LATEST" ] || { echo "version was not bumped"; exit 1; }
+          # patch bump: highest two components unchanged
+          [ "${NEW%.*}" = "${LATEST%.*}" ] || { echo "expected a patch bump, got $LATEST -> $NEW"; exit 1; }
+      - name: jsr-publish-watch — dry-run gate short-circuits
+        run: |
+          set -euo pipefail
+          JSR_PUBLISH_DRY_RUN=1 bash scripts/jsr-publish-watch.sh mrg-keystone keep 0.0.0 | grep -q "dry-run"

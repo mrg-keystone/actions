@@ -1,0 +1,164 @@
+# Reusable JSR publish: push to main → validate → settle in-flight → compute
+# next version → bump if needed → publish, watched against the registry.
+#
+# Call it from any JSR package repo:
+#
+#   jobs:
+#     publish:
+#       uses: mrg-keystone/actions/.github/workflows/jsr-publish.yml@main
+#       secrets: inherit            # passes the caller's JSR_TOKEN
+#
+# The caller's workflow needs `on: push: branches: [main]` and the repo a
+# JSR_TOKEN secret. Scope/package come from deno.json's "name".
+#
+# Hard-won defenses baked in (each one cost a broken release to learn):
+#   - preflight emulates JSR's server-side jsr:-subpath dependency validation
+#     locally (a failure class `deno publish --dry-run` cannot catch) before
+#     anything else runs;
+#   - the version is derived from the AUTHORITATIVE api.jsr.io list, never
+#     the CDN-cached meta.json (which lags minutes and derives wrong bumps),
+#     and only after any in-flight publishing task has settled;
+#   - `deno publish` is never trusted to terminate: the registry is polled
+#     for the version (success) and the publishing task (failure — the CLI
+#     waits forever on a failed server-side task), with task status
+#     transitions streamed to the log and the server's real error surfaced;
+#   - provenance is skipped (stalls on runners; unnecessary with token auth);
+#   - one retry for transient upload failures; a hard timeout caps the run
+#     (server-side processing alone has been observed to take 34 minutes);
+#   - runs are serialized per repo so concurrent pushes can't race a bump.
+
+name: JSR Publish
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory containing deno.json (monorepos)"
+        type: string
+        default: "."
+      dry-run:
+        description: "Validate + compute the version, but do not publish or commit"
+        type: boolean
+        default: false
+      timeout-minutes:
+        description: "Hard cap for the publish job"
+        type: number
+        default: 50
+      publish-timeout-seconds:
+        description: "How long to wait for the registry before declaring the publish dead. JSR's reaper requeues stranded tasks after ~30 min (jsr-io/jsr#1449), so the realistic worst case is ~40 min."
+        type: number
+        default: 2400
+      deno-version:
+        description: "denoland/setup-deno version spec"
+        type: string
+        default: "v2.x"
+      allow-slow-types:
+        description: "Pass --allow-slow-types to deno publish"
+        type: boolean
+        default: true
+      bump-commit:
+        description: "Commit an auto-bump back to the branch"
+        type: boolean
+        default: true
+    secrets:
+      JSR_TOKEN:
+        description: "JSR publish token (required unless dry-run)"
+        required: false
+    outputs:
+      version:
+        description: "The version that was (or would be) published"
+        value: ${{ jobs.publish.outputs.version }}
+      bumped:
+        description: "Whether the version was auto-bumped"
+        value: ${{ jobs.publish.outputs.bumped }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout-minutes) }}
+    concurrency:
+      group: jsr-publish-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      bumped: ${{ steps.ver.outputs.bumped }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      JSR_TOKEN: ${{ secrets.JSR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The helper scripts live in THIS (the reusable workflow's) repo, which
+      # is not the workspace at run time — check it out alongside. The `job`
+      # context carries the reusable workflow's own identity (the `github`
+      # context reflects the CALLER); fall back to parsing github.workflow_ref
+      # ("owner/repo/.github/workflows/file.yml@refs/heads/main") where the
+      # job.* properties are unavailable.
+      - name: Resolve the actions repo + ref
+        id: self
+        working-directory: .
+        run: |
+          REPO="${{ job.workflow_repository }}"
+          REF="${{ job.workflow_sha }}"
+          if [ -z "$REPO" ] || [ -z "$REF" ]; then
+            WF_REF="${{ github.workflow_ref }}"
+            REPO="$(echo "$WF_REF" | cut -d/ -f1-2)"
+            REF="${WF_REF##*@}"
+          fi
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Using scripts from $REPO@$REF"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.self.outputs.repo }}
+          ref: ${{ steps.self.outputs.ref }}
+          path: .jsr-publish-actions
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ inputs.deno-version }}
+
+      - name: Preflight — emulate JSR's server-side checks locally
+        run: |
+          deno run --allow-net --allow-read "$GITHUB_WORKSPACE/.jsr-publish-actions/scripts/check-jsr-deps.ts" deno.json
+          deno publish --dry-run --allow-dirty --no-provenance ${{ inputs.allow-slow-types && '--allow-slow-types' || '' }}
+
+      - name: Compute the next version (settles in-flight publishes first)
+        id: ver
+        run: |
+          bash "$GITHUB_WORKSPACE/.jsr-publish-actions/scripts/jsr-next-version.sh" \
+            deno.json "${{ github.event.before }}..${{ github.event.after }}"
+
+      - name: Publish to JSR (registry-watched; never trusts the CLI to exit)
+        env:
+          JSR_PUBLISH_TIMEOUT_SECS: ${{ inputs.publish-timeout-seconds }}
+          JSR_PUBLISH_DRY_RUN: ${{ inputs.dry-run && '1' || '0' }}
+        run: |
+          bash "$GITHUB_WORKSPACE/.jsr-publish-actions/scripts/jsr-publish-watch.sh" \
+            "${{ steps.ver.outputs.scope }}" "${{ steps.ver.outputs.pkg }}" "${{ steps.ver.outputs.version }}" \
+            --allow-dirty --no-provenance ${{ inputs.allow-slow-types && '--allow-slow-types' || '' }}
+
+      - name: Commit the auto-bump back
+        if: steps.ver.outputs.bumped == 'true' && !inputs.dry-run && inputs.bump-commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deno.json
+          git commit -m "release: v${{ steps.ver.outputs.version }} (auto-bump)"
+          git push || echo "::warning::could not push the version bump; the next run re-derives from the JSR latest"
+
+      - name: Summary
+        if: always()
+        working-directory: .
+        run: |
+          {
+            echo "## JSR publish"
+            echo "- package: \`@${{ steps.ver.outputs.scope }}/${{ steps.ver.outputs.pkg }}\`"
+            echo "- version: \`${{ steps.ver.outputs.version }}\` (bumped: ${{ steps.ver.outputs.bumped }})"
+            echo "- dry-run: ${{ inputs.dry-run }}"
+            echo "- https://jsr.io/@${{ steps.ver.outputs.scope }}/${{ steps.ver.outputs.pkg }}"
+          } >> "$GITHUB_STEP_SUMMARY"
