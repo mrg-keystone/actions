@@ -1,0 +1,212 @@
+# Reusable GitHub release: resolve the release for the pushed ref, make sure
+# rolling releases exist (never delete them), gather built artifacts + skill
+# tarballs + extra assets, and publish everything in ONE upload.
+#
+# Deploy model (rune pioneered it; now shared):
+#   - push to <main-branch>    -> rolling `latest` release, make_latest (the
+#                                 canonical install target)
+#   - push to <develop-branch> -> rolling `develop` release (NOT latest, never
+#                                 disturbs stable users)
+#   - push a `v*` tag          -> pinned snapshot release (NOT latest)
+#   - anything else            -> error, unless `tag` is set explicitly
+#
+# Call it after your build job(s); hand binaries over as artifacts:
+#
+#   jobs:
+#     build:
+#       strategy: { matrix: ... }
+#       steps:
+#         - ... compile, sign, tar ...
+#         - uses: actions/upload-artifact@v4
+#           with: { name: release-${{ matrix.target }}, path: "*.tar.gz*" }
+#     release:
+#       needs: [build]
+#       uses: mrg-keystone/actions/.github/workflows/gh-release.yml@main
+#       with:
+#         artifact-pattern: release-*
+#         extra-assets: |
+#           scripts/install.sh
+#
+# Hard-won defenses baked in:
+#   - rolling releases are created if missing but NEVER deleted/recreated —
+#     delete-then-recreate left a ~2-minute window where `latest` was absent
+#     and installers 404'd;
+#   - all assets land in ONE softprops upload — parallel uploads of the same
+#     asset name from matrix legs race and corrupt the release;
+#   - `make_latest` only for the main rolling release, so develop builds and
+#     pinned snapshots never hijack the default installer.
+
+name: GitHub Release
+
+on:
+  workflow_call:
+    inputs:
+      artifact-pattern:
+        description: "actions/download-artifact pattern for build artifacts (empty = no artifacts)"
+        type: string
+        default: ""
+      extra-assets:
+        description: "Newline-separated file globs from the caller's checkout to attach"
+        type: string
+        default: ""
+      pack-skills:
+        description: "Pack each skills/<name>/ dir into <name>-skill.tar.gz"
+        type: boolean
+        default: true
+      tag:
+        description: "Explicit release tag (overrides ref resolution)"
+        type: string
+        default: ""
+      main-branch:
+        description: "Branch whose pushes deploy the rolling `latest` release"
+        type: string
+        default: "main"
+      develop-branch:
+        description: "Branch whose pushes deploy the rolling `develop` release"
+        type: string
+        default: "develop"
+      dry-run:
+        description: "Resolve + collect + list, but do not create or upload anything"
+        type: boolean
+        default: false
+    outputs:
+      tag:
+        description: "The release tag that was published"
+        value: ${{ jobs.release.outputs.tag }}
+      make-latest:
+        description: "Whether this release was marked latest"
+        value: ${{ jobs.release.outputs.make_latest }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: gh-release-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
+      make_latest: ${{ steps.rel.outputs.make_latest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: rel
+        env:
+          TAG_OVERRIDE: ${{ inputs.tag }}
+          MAIN: refs/heads/${{ inputs.main-branch }}
+          DEVELOP: refs/heads/${{ inputs.develop-branch }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TAG_OVERRIDE" ]; then
+            echo "tag=$TAG_OVERRIDE" >> "$GITHUB_OUTPUT"
+            echo "rolling=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "title=$TAG_OVERRIDE" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "rolling=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "title=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REF" = "$MAIN" ]; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "rolling=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            echo "title=latest (${{ inputs.main-branch }})" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REF" = "$DEVELOP" ]; then
+            echo "tag=develop" >> "$GITHUB_OUTPUT"
+            echo "rolling=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+            echo "title=develop (rolling)" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::ref $GITHUB_REF is not ${{ inputs.main-branch }}, ${{ inputs.develop-branch }}, or a v* tag — pass an explicit 'tag' input" >&2
+            exit 1
+          fi
+
+      # Create-if-missing, never delete: the build jobs overwrite fixed-name
+      # assets in place so the rolling release stays downloadable throughout.
+      - name: Ensure rolling release exists
+        if: steps.rel.outputs.rolling == 'true' && !inputs.dry-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ steps.rel.outputs.tag }}" -R "${{ github.repository }}" >/dev/null 2>&1 \
+            || gh release create "${{ steps.rel.outputs.tag }}" -R "${{ github.repository }}" \
+                 --title "${{ steps.rel.outputs.tag }}" --notes "rolling release" --latest=false
+
+      - name: Download build artifacts
+        if: inputs.artifact-pattern != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact-pattern }}
+          path: dist
+          merge-multiple: true
+
+      - name: Pack skills
+        if: inputs.pack-skills
+        run: |
+          mkdir -p dist
+          if ls skills/*/SKILL.md >/dev/null 2>&1; then
+            for d in skills/*/; do
+              n="$(basename "$d")"
+              tar -C "$d" -czf "dist/$n-skill.tar.gz" .
+              echo "packed dist/$n-skill.tar.gz"
+            done
+          else
+            echo "no skills/ dir — nothing to pack"
+          fi
+
+      - name: Collect assets
+        id: assets
+        env:
+          EXTRA: ${{ inputs.extra-assets }}
+        run: |
+          set -euo pipefail
+          : > /tmp/assets.txt
+          [ -d dist ] && find dist -maxdepth 1 -type f | sort >> /tmp/assets.txt
+          if [ -n "$EXTRA" ]; then
+            while IFS= read -r pat; do
+              pat="$(echo "$pat" | xargs)" # trim
+              [ -z "$pat" ] && continue
+              # shellcheck disable=SC2086
+              found=$(ls $pat 2>/dev/null) || { echo "::error::extra asset not found: $pat"; exit 1; }
+              echo "$found" >> /tmp/assets.txt
+            done <<< "$EXTRA"
+          fi
+          if ! [ -s /tmp/assets.txt ]; then
+            echo "::error::no assets to publish (no artifacts, no skills, no extra-assets)"
+            exit 1
+          fi
+          echo "Publishing to '${{ steps.rel.outputs.tag }}' (make_latest: ${{ steps.rel.outputs.make_latest }}):"
+          sed 's/^/  - /' /tmp/assets.txt
+          {
+            echo "files<<EOF"
+            cat /tmp/assets.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dry run — stop before publishing
+        if: inputs.dry-run
+        run: echo "[dry-run] not publishing"
+
+      - name: Publish release
+        if: ${{ !inputs.dry-run }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: ${{ steps.rel.outputs.title }}
+          make_latest: ${{ steps.rel.outputs.make_latest }}
+          prerelease: false
+          files: ${{ steps.assets.outputs.files }}
+          fail_on_unmatched_files: true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## GitHub release"
+            echo "- tag: \`${{ steps.rel.outputs.tag }}\` (make_latest: ${{ steps.rel.outputs.make_latest }}, dry-run: ${{ inputs.dry-run }})"
+            echo '```'
+            cat /tmp/assets.txt 2>/dev/null || echo "(no assets collected)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

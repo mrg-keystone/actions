@@ -2,6 +2,52 @@
 
 Reusable GitHub Actions workflows for the org.
 
+| workflow | for | used by |
+|---|---|---|
+| `jsr-publish` | Deno packages → JSR | keep |
+| `gh-release` | binaries / skills / installers → GitHub Releases | rune, keep (skill) |
+
+## gh-release
+
+Resolve the release for the pushed ref, ensure rolling releases exist
+(**never** delete them — delete-then-recreate leaves a window where
+installers 404), gather build artifacts + skill tarballs + extra assets, and
+publish everything in **one** upload (parallel uploads of the same asset
+name from matrix legs race).
+
+Deploy model: push to `main` → rolling `latest` (make_latest, the canonical
+install target); push to `develop` → rolling `develop` (never latest); push
+a `v*` tag → pinned snapshot (never latest); anything else errors unless
+`tag` is passed.
+
+```yaml
+jobs:
+  build:
+    strategy:
+      matrix: { include: [...] }
+    steps:
+      - # compile, sign, tar, shasum ...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: "*.tar.gz*"
+  release:
+    needs: [build]
+    uses: mrg-keystone/actions/.github/workflows/gh-release.yml@main
+    permissions:
+      contents: write
+    with:
+      artifact-pattern: release-*
+      extra-assets: |
+        scripts/install.sh
+```
+
+Inputs: `artifact-pattern` (download-artifact pattern; empty = none),
+`extra-assets` (newline globs from the caller checkout), `pack-skills`
+(default true: each `skills/<name>/` → `<name>-skill.tar.gz`), `tag`
+(explicit override), `main-branch`/`develop-branch`, `dry-run`.
+Outputs: `tag`, `make-latest`.
+
 ## jsr-publish
 
 Push to main → validate → settle in-flight publishes → compute the next

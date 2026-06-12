@@ -18,6 +18,30 @@ jobs:
       working-directory: fixtures/smoke-package
       dry-run: true
 
+  make-artifact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Build a fake release artifact
+        run: |
+          mkdir -p out && echo "smoke" > out/smoke-binary
+          tar -czf smoke-x86_64.tar.gz -C out .
+          shasum -a 256 smoke-x86_64.tar.gz > smoke-x86_64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-smoke
+          path: smoke-x86_64.tar.gz*
+
+  gh-release-dry-run:
+    needs: make-artifact
+    uses: ./.github/workflows/gh-release.yml
+    with:
+      artifact-pattern: release-*
+      extra-assets: |
+        README.md
+      tag: self-test
+      dry-run: true
+
   scripts-unit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
