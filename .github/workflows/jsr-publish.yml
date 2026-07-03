@@ -60,6 +60,10 @@ on:
         description: "Commit an auto-bump back to the branch"
         type: boolean
         default: true
+      refresh-latest:
+        description: "Whitespace/newline-separated JSR packages (e.g. `@mrg-keystone/rune`) to repin to their newest published version — across this deno.json AND its workspace members — BEFORE the version is computed and the package published. The repin ships in the same tarball and rides the same auto-bump commit, so every cut targets the latest of the deps it chooses to track. Empty = off (default)."
+        type: string
+        default: ""
     secrets:
       JSR_TOKEN:
         description: "JSR publish token (required unless dry-run)"
@@ -122,6 +126,20 @@ jobs:
         with:
           deno-version: ${{ inputs.deno-version }}
 
+      # Repin tracked deps to their newest published version FIRST, so preflight validates the new
+      # pins, the publish ships them, and the commit-back carries them — one run, one tarball, one
+      # commit. Runs before version-compute so a dep change is part of the cut, not a run behind it.
+      - name: Refresh tracked deps to their latest published version
+        id: refresh
+        if: inputs.refresh-latest != ''
+        run: |
+          deno run --allow-net --allow-read --allow-write --allow-env \
+            "$GITHUB_WORKSPACE/.jsr-publish-actions/scripts/refresh-latest-deps.ts" \
+            deno.json ${{ inputs.refresh-latest }}
+          # Reconcile the lockfile with any new floor so the committed tree is self-consistent (deno
+          # also self-heals the lock on publish, so a relock hiccup must not fail the release).
+          deno install --quiet || echo "::warning::lock relock after refresh failed; deno reconciles it on publish"
+
       - name: Preflight — emulate JSR's server-side checks locally
         run: |
           deno run --allow-net --allow-read "$GITHUB_WORKSPACE/.jsr-publish-actions/scripts/check-jsr-deps.ts" deno.json
@@ -143,15 +161,20 @@ jobs:
             --allow-dirty --no-provenance ${{ inputs.allow-slow-types && '--allow-slow-types' || '' }}
 
       - name: Commit the auto-bump back
-        if: steps.ver.outputs.bumped == 'true' && !inputs.dry-run && inputs.bump-commit
+        if: (steps.ver.outputs.bumped == 'true' || steps.refresh.outputs.changed == 'true') && !inputs.dry-run && inputs.bump-commit
         run: |
-          if git diff --quiet -- deno.json; then
-            echo "deno.json unchanged (bump resolved to the current version) — nothing to commit"
-            exit 0
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage the version bump (deno.json), the reconciled lock, and any refresh-latest repin
+          # (workspace member configs the script reports). Stage EXPLICITLY — never `git add -A`: the
+          # reusable workflow checks its own scripts out into .jsr-publish-actions/ in this workspace.
           git add deno.json
+          [ -f deno.lock ] && git add deno.lock || true
+          while IFS= read -r f; do [ -n "$f" ] && git add -- "$f"; done <<< "${{ steps.refresh.outputs.files }}"
+          if git diff --cached --quiet; then
+            echo "nothing staged (bump resolved to the current version and no dep changed) — nothing to commit"
+            exit 0
+          fi
           git commit -m "release: v${{ steps.ver.outputs.version }} (auto-bump)"
           git push || echo "::warning::could not push the version bump; the next run re-derives from the JSR latest"
 
