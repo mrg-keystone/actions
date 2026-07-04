@@ -89,8 +89,39 @@ drifts from JSR.
 | `deno-version` | `v2.x` | denoland/setup-deno spec |
 | `allow-slow-types` | `true` | pass `--allow-slow-types` |
 | `bump-commit` | `true` | commit the auto-bump back to the branch |
+| `refresh-latest` | `""` | JSR packages to repin to latest before publishing (see below) |
 
 Outputs: `version`, `bumped`.
+
+### Tracking a dependency's latest (`refresh-latest`)
+
+Pass a whitespace/newline-separated list of JSR packages and each cut repins
+them to their newest published version — across `deno.json` **and** every
+workspace member — *before* the version is computed and the package is
+published:
+
+```yaml
+jobs:
+  publish:
+    uses: mrg-keystone/actions/.github/workflows/jsr-publish.yml@main
+    secrets:
+      JSR_TOKEN: ${{ secrets.JSR_TOKEN }}
+    with:
+      refresh-latest: "@mrg-keystone/rune"
+```
+
+The repin happens in the same checkout, so it ships in the same tarball and
+rides the same `release: vX (auto-bump)` commit — no second run, and no
+reliance on a CI push re-triggering `on: push` (a `GITHUB_TOKEN` push does
+not). It rewrites raw text (comments/formatting survive) and matches every
+import whose value targets the package, whatever the map key — a bare
+`@scope/pkg` or an aliased subpath like `#assert` → `.../pkg@X/assert`. A
+no-op when everything is already at its latest floor, so nothing is committed
+or published unless a tracked dep actually moved. `latestVersion` comes from
+authoritative `api.jsr.io`, and preflight then validates the new pins before
+publish. It only reaches a package that a real cut publishes — a dep that
+moves while nobody pushes lands on the next release, which is when "the
+published package's deps" is what actually matters.
 
 ### Why the registry-watching dance (the hang taxonomy)
 
