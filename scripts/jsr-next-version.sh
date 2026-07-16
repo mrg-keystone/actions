@@ -65,9 +65,16 @@ fi
 # above just PROVED that VER is published, so the base is max(list, VER).
 LIST_LATEST="$(curl -fsS -A "$UA" ${JSR_TOKEN:+-H "Authorization: Bearer $JSR_TOKEN"} \
   "$API/versions?limit=1000&cb=$(date +%s)" |
-  jq -r '(.items // .) | .[]? | select(.yanked != true) | .version' | sort -V | tail -1)"
+  jq -r '(.items // .) | .[]? | select(.yanked != true) | .version | select(contains("-") | not)' | sort -V | tail -1)"
 LATEST="$(printf '%s\n%s\n' "$LIST_LATEST" "$VER" | sort -V | tail -1)"
 [ "$LATEST" != "$LIST_LATEST" ] && echo "::notice::versions list is CDN-stale (says $LIST_LATEST; $VER is proven published) — basing the bump on $VER"
+# Prereleases (X.Y.Z-beta.N) are never a release base: sort -V ranks them ABOVE
+# their stable base, so one beta on the registry would poison every bump — and
+# the patch-field arithmetic below chokes on "N-beta". Bump from the base.
+if [[ "$LATEST" == *-* ]]; then
+  echo "::notice::latest ($LATEST) is a prerelease — bumping from its base ${LATEST%%-*}"
+  LATEST="${LATEST%%-*}"
+fi
 BUMP=patch
 if [ -n "$RANGE" ] && git rev-parse -q --verify "${RANGE%%..*}^{commit}" >/dev/null 2>&1; then
   LOG="$(git log --format=%B "$RANGE")"
