@@ -60,6 +60,10 @@ on:
         description: "Commit an auto-bump back to the branch"
         type: boolean
         default: true
+      flatten-workspace:
+        description: "Strip the `workspace` field from deno.json for the DURATION of the publish, restoring it (same position, bumped version intact) before the auto-bump commit. Lets a workspace ROOT publish as one package whose exports reach into member directories — Deno hard-excludes workspace members from a root tarball (error[excluded-module]) and publish.include cannot override it. Dev keeps the workspace; only the published graph sees plain folders. NOTE: member-local import maps do not apply to the published graph — code reachable from exports must use jsr:/npm: or root-mapped specifiers."
+        type: boolean
+        default: false
       refresh-latest:
         description: "Whitespace/newline-separated JSR packages (e.g. `@mrg-keystone/rune`) to repin to their newest published version — across this deno.json AND its workspace members — BEFORE the version is computed and the package published. The repin ships in the same tarball and rides the same auto-bump commit, so every cut targets the latest of the deps it chooses to track. Empty = off (default)."
         type: string
@@ -140,6 +144,20 @@ jobs:
           # also self-heals the lock on publish, so a relock hiccup must not fail the release).
           deno install --quiet || echo "::warning::lock relock after refresh failed; deno reconciles it on publish"
 
+      - name: Flatten workspace for publish
+        if: inputs.flatten-workspace
+        run: |
+          deno eval '
+            const path = "deno.json";
+            const d = JSON.parse(Deno.readTextFileSync(path));
+            if (!("workspace" in d)) { console.log("flatten-workspace: no workspace field - nothing to do"); Deno.exit(0); }
+            const stash = Deno.env.get("GITHUB_WORKSPACE") + "/.jsr-publish-actions/flattened-workspace.json";
+            Deno.writeTextFileSync(stash, JSON.stringify({ index: Object.keys(d).indexOf("workspace"), value: d.workspace }));
+            delete d.workspace;
+            Deno.writeTextFileSync(path, JSON.stringify(d, null, 2) + "\n");
+            console.log("flatten-workspace: stripped for publish (members will ship in the root tarball)");
+          '
+
       - name: Preflight — emulate JSR's server-side checks locally
         run: |
           deno run --allow-net --allow-read "$GITHUB_WORKSPACE/.jsr-publish-actions/scripts/check-jsr-deps.ts" deno.json
@@ -159,6 +177,20 @@ jobs:
           bash "$GITHUB_WORKSPACE/.jsr-publish-actions/scripts/jsr-publish-watch.sh" \
             "${{ steps.ver.outputs.scope }}" "${{ steps.ver.outputs.pkg }}" "${{ steps.ver.outputs.version }}" \
             --allow-dirty --no-provenance ${{ inputs.allow-slow-types && '--allow-slow-types' || '' }}
+
+      - name: Restore workspace field (flatten was publish-scoped only)
+        if: inputs.flatten-workspace && always()
+        run: |
+          deno eval '
+            const stash = Deno.env.get("GITHUB_WORKSPACE") + "/.jsr-publish-actions/flattened-workspace.json";
+            let saved; try { saved = JSON.parse(Deno.readTextFileSync(stash)); } catch { console.log("flatten-workspace: nothing stashed - nothing to restore"); Deno.exit(0); }
+            const path = "deno.json";
+            const d = JSON.parse(Deno.readTextFileSync(path));
+            const entries = Object.entries(d).filter(([k]) => k !== "workspace");
+            entries.splice(Math.min(saved.index, entries.length), 0, ["workspace", saved.value]);
+            Deno.writeTextFileSync(path, JSON.stringify(Object.fromEntries(entries), null, 2) + "\n");
+            console.log("flatten-workspace: restored (bumped version kept, workspace back at its original position)");
+          '
 
       - name: Commit the auto-bump back
         if: (steps.ver.outputs.bumped == 'true' || steps.refresh.outputs.changed == 'true') && !inputs.dry-run && inputs.bump-commit

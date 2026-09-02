@@ -1,0 +1,10 @@
+{
+  "name": "@mrg-keystone/selftest-flatten-mono",
+  "version": "0.0.1",
+  "license": "MIT",
+  "workspace": ["./projects/one", "./projects/two"],
+  "exports": {
+    "./one": "./projects/one/mod.ts",
+    "./two": "./projects/two/mod.ts"
+  }
+}

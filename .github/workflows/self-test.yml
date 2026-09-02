@@ -18,6 +18,16 @@ jobs:
       working-directory: fixtures/smoke-package
       dry-run: true
 
+  # Regression: a workspace root publishing members via flatten-workspace.
+  # Without the flatten step this fixture fails preflight with
+  # error[excluded-module] on both member modules.
+  jsr-publish-flatten-dry-run:
+    uses: ./.github/workflows/jsr-publish.yml
+    with:
+      working-directory: fixtures/flatten-mono
+      dry-run: true
+      flatten-workspace: true
+
   make-artifact:
     runs-on: ubuntu-latest
     timeout-minutes: 5
